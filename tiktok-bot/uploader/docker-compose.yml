@@ -1,0 +1,94 @@
+# Production-ready local-first compose.
+#
+# Services:
+#   tiktok-base — helper service that only exists to build the shared base
+#                 image that api, scheduler, and novnc all derive from.
+#                 `docker compose build` builds it once; dependent services
+#                 pull it by name.
+#   api         — FastAPI REST API + OpenAPI docs at /docs (port 8000)
+#   scheduler   — polling worker for scheduled uploads
+#   novnc       — virtual browser for TikTok login
+#   webapp      — React UI served by nginx, proxies /api and /novnc (port 3000)
+#
+# Ports are bound to 127.0.0.1 so nothing is exposed outside the host.
+# Only the webapp and API ports are bound — scheduler and noVNC control port
+# stay on the internal compose network.
+
+services:
+  tiktok-base:
+    image: tiktok-base:latest
+    build:
+      context: .
+      dockerfile: docker/base.Dockerfile
+    command: ["true"]  # never runs; exists to build the image
+
+  api:
+    image: tiktok-api:latest
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    depends_on:
+      - tiktok-base
+    environment:
+      - TIKTOK_API_DB_PATH=/data/tiktok.db
+      - TIKTOK_CONFIG_PATH=/app/config.txt
+      - NOVNC_CONTROL_URL=http://novnc:7900
+      - NOVNC_PUBLIC_URL=/novnc/vnc.html
+      - API_PUBLIC_URL=http://api:8000
+    volumes:
+      - ./data:/data
+      - ./config.txt:/app/config.txt:ro
+    working_dir: /data  # so Config() resolves CookiesDir/VideosDirPath on the volume
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  scheduler:
+    image: tiktok-scheduler:latest
+    build:
+      context: .
+      dockerfile: scheduler/Dockerfile
+    depends_on:
+      - tiktok-base
+      - api
+    environment:
+      - TIKTOK_API_DB_PATH=/data/tiktok.db
+      - TIKTOK_CONFIG_PATH=/app/config.txt
+      - SCHEDULER_POLL_SECONDS=30
+      - SCHEDULER_CONCURRENCY=1
+    volumes:
+      - ./data:/data
+      - ./config.txt:/app/config.txt:ro
+    working_dir: /data
+    restart: unless-stopped
+
+  novnc:
+    image: tiktok-novnc:latest
+    build:
+      context: .
+      dockerfile: novnc/Dockerfile
+    depends_on:
+      - tiktok-base
+    volumes:
+      - ./data:/data
+    working_dir: /data
+    tmpfs:
+      # Mitigates Chromium OOM on TikTok's heavy login page (design-review flag).
+      - /dev/shm:size=512m
+    # noVNC ports stay internal — webapp nginx proxies them.
+    expose:
+      - "6080"
+      - "7900"
+    restart: unless-stopped
+
+  webapp:
+    image: tiktok-webapp:latest
+    build:
+      context: .
+      dockerfile: webapp/Dockerfile
+    depends_on:
+      - api
+      - novnc
+    ports:
+      - "127.0.0.1:3000:80"
+    restart: unless-stopped

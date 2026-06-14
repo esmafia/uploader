@@ -1,0 +1,14 @@
+python-telegram-bot==20.7
+aiohttp==3.9.3
+aiofiles==23.2.1
+# TiktokAutoUploader dependencies
+beautifulsoup4>=4.12
+fake-useragent>=1.4
+moviepy>=1.0.3,<2.0
+numpy>=1.26
+pillow>=10.2
+python-dotenv>=1.0
+requests>=2.31
+requests-auth-aws-sigv4>=0.7
+yt-dlp
+undetected-chromedriver @ git+https://github.com/dustinfarris/undetected-chromedriver.git@b6b58a1eecdadf37e1b159cf2b8138047a0ecc3f

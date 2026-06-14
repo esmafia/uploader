@@ -1,0 +1,15 @@
+.git
+.venv*
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+webapp/node_modules/
+webapp/dist/
+data/
+CookiesDir/
+VideosDirPath/
+*.cookie
+.pytest_cache/
+.coverage
+tests/

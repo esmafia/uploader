@@ -1,15 +1,27 @@
 """
 Telegram Bot for TikTok Auto Uploader
 State machine via context.user_data — no ConversationHandler.
+
+Improvements:
+- Video upload streams from disk (no full-file RAM buffer)
+- Upload runs in background thread — bot never freezes
+- Delete account support
+- Bulk import: give a TikTok/YouTube channel URL, bot downloads oldest→newest
+  and publishes each video without stopping
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import sys
+import threading
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -22,10 +34,10 @@ from telegram.ext import (
 )
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
+BASE_DIR    = Path(__file__).parent
 UPLOADER_DIR = BASE_DIR / "uploader"
-COOKIES_DIR = UPLOADER_DIR / "CookiesDir"
-VIDEOS_DIR = UPLOADER_DIR / "VideosDirPath"
+COOKIES_DIR  = UPLOADER_DIR / "CookiesDir"
+VIDEOS_DIR   = UPLOADER_DIR / "VideosDirPath"
 
 COOKIES_DIR.mkdir(parents=True, exist_ok=True)
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
@@ -44,6 +56,25 @@ S_ADD_ACCOUNT_NAME   = "add_account_name"
 S_ADD_ACCOUNT_COOKIE = "add_account_cookie"
 S_UPLOAD_VIDEO       = "upload_video"
 S_UPLOAD_TITLE       = "upload_title"
+S_BULK_ACCOUNT       = "bulk_account"      # waiting for account selection for bulk import
+S_BULK_URL           = "bulk_url"          # waiting for channel URL
+
+# ── Background bulk-import queue ──────────────────────────────────────────
+# Each entry: {"chat_id", "account", "url", "visibility"}
+@dataclass
+class BulkJob:
+    chat_id: int
+    account: str
+    url: str
+    visibility: int
+    status: str = "pending"       # pending | running | done | error | cancelled
+    current: int = 0
+    total: int = 0
+    cancel_flag: threading.Event = field(default_factory=threading.Event)
+
+# Global: chat_id -> BulkJob (one job per chat at a time)
+_bulk_jobs: dict[int, BulkJob] = {}
+_bulk_lock  = threading.Lock()
 
 
 def set_state(context: ContextTypes.DEFAULT_TYPE, state: str | None) -> None:
@@ -65,7 +96,15 @@ def get_saved_accounts() -> list[str]:
     return sorted(accounts)
 
 
-def run_uploader(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
+def delete_account(name: str) -> bool:
+    cookie_file = COOKIES_DIR / f"tiktok_session-{name}"
+    if cookie_file.exists():
+        cookie_file.unlink()
+        return True
+    return False
+
+
+def run_uploader(args: list[str], timeout: int = 600) -> tuple[int, str, str]:
     cmd = [sys.executable, "cli.py"] + args
     result = subprocess.run(
         cmd, cwd=str(UPLOADER_DIR), capture_output=True, text=True, timeout=timeout,
@@ -75,24 +114,34 @@ def run_uploader(args: list[str], timeout: int = 180) -> tuple[int, str, str]:
 
 def main_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Загрузить видео",  callback_data="menu_upload")],
-        [InlineKeyboardButton("👤 Добавить аккаунт", callback_data="menu_add_account")],
-        [InlineKeyboardButton("📋 Мои аккаунты",     callback_data="menu_accounts")],
-        [InlineKeyboardButton("ℹ️ Помощь",           callback_data="menu_help")],
+        [InlineKeyboardButton("📤 Загрузить видео",       callback_data="menu_upload")],
+        [InlineKeyboardButton("🔗 Импорт из аккаунта",   callback_data="menu_bulk")],
+        [InlineKeyboardButton("👤 Добавить аккаунт",      callback_data="menu_add_account")],
+        [InlineKeyboardButton("📋 Мои аккаунты",          callback_data="menu_accounts")],
+        [InlineKeyboardButton("ℹ️ Помощь",                callback_data="menu_help")],
     ])
 
 
 async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     set_state(context, S_IDLE)
-    context.user_data.pop("account", None)
-    context.user_data.pop("video_path", None)
-    context.user_data.pop("youtube_url", None)
-    context.user_data.pop("title", None)
-    context.user_data.pop("account_name", None)
+    for key in ("account", "video_path", "youtube_url", "title", "account_name",
+                "bulk_url", "bulk_visibility"):
+        context.user_data.pop(key, None)
 
     accounts = get_saved_accounts()
     info = f"✅ Аккаунтов: {len(accounts)}" if accounts else "⚠️ Нет сохранённых аккаунтов"
-    text = f"🎵 *TikTok Auto Uploader Bot*\n\n{info}\n\nВыберите действие:"
+
+    # Show bulk-import status if running
+    chat_id = update.effective_chat.id
+    with _bulk_lock:
+        job = _bulk_jobs.get(chat_id)
+    bulk_line = ""
+    if job and job.status == "running":
+        bulk_line = f"\n\n🔄 *Импорт:* видео {job.current}/{job.total or '?'}"
+    elif job and job.status == "done":
+        bulk_line = f"\n\n✅ *Импорт завершён:* {job.current} видео загружено"
+
+    text = f"🎵 *TikTok Auto Uploader Bot*\n\n{info}{bulk_line}\n\nВыберите действие:"
 
     if update.callback_query:
         await update.callback_query.edit_message_text(
@@ -136,16 +185,17 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
-# ── Callback query handler (all button presses) ────────────────────────────
+# ── Callback query handler (all button presses) ─────────────────────────────
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    data  = query.data
+    query   = update.callback_query
+    data    = query.data
+    chat_id = update.effective_chat.id
     logger.info("on_callback user=%s data=%s state=%s", update.effective_user.id, data, get_state(context))
     await query.answer()
 
     # ── Main menu ──────────────────────────────────────────────────────────
-    if data == "menu_back" or data == "menu_start":
+    if data in ("menu_back", "menu_start"):
         await send_main_menu(update, context)
         return
 
@@ -163,23 +213,71 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "3. Скопируйте значение `sessionid`\n\n"
             "*Как загрузить видео:*\n"
             "• Отправьте mp4/mov/avi файл\n"
-            "• Или YouTube-ссылку"
+            "• Или YouTube-ссылку\n\n"
+            "*Импорт из аккаунта:*\n"
+            "• Дайте ссылку на YouTube/TikTok-канал\n"
+            "• Бот скачает все видео от старых к новым\n"
+            "• И опубликует их в TikTok без остановки"
         )
         back = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]])
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back)
         return
 
+    # ── Accounts list with delete buttons ─────────────────────────────────
     if data == "menu_accounts":
         accounts = get_saved_accounts()
         if not accounts:
             text = "📭 Нет сохранённых аккаунтов."
+            kb = [[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]]
         else:
-            lines = "\n".join(f"• `{a}`" for a in accounts)
-            text = f"👤 *Сохранённые аккаунты* ({len(accounts)}):\n\n{lines}"
-        back = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="menu_back")]])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back)
+            text = "👤 *Сохранённые аккаунты* — нажмите 🗑 для удаления:"
+            kb = []
+            for a in accounts:
+                kb.append([
+                    InlineKeyboardButton(f"👤 {a}", callback_data=f"acc_info_{a}"),
+                    InlineKeyboardButton("🗑 Удалить", callback_data=f"del_acc_{a}"),
+                ])
+            kb.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_back")])
+        await query.edit_message_text(text, parse_mode="Markdown",
+                                      reply_markup=InlineKeyboardMarkup(kb))
         return
 
+    # ── Delete account ─────────────────────────────────────────────────────
+    if data.startswith("del_acc_"):
+        name = data[8:]
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"del_acc_confirm_{name}"),
+            InlineKeyboardButton("❌ Отмена",       callback_data="menu_accounts"),
+        ]])
+        await query.edit_message_text(
+            f"⚠️ Удалить аккаунт `{name}`?\n\nЭто удалит cookie-файл и сессию.",
+            parse_mode="Markdown", reply_markup=kb,
+        )
+        return
+
+    if data.startswith("del_acc_confirm_"):
+        name = data[16:]
+        ok = delete_account(name)
+        msg = f"✅ Аккаунт `{name}` удалён." if ok else f"❌ Аккаунт `{name}` не найден."
+        accounts = get_saved_accounts()
+        if not accounts:
+            kb_rows = []
+        else:
+            kb_rows = []
+            for a in accounts:
+                kb_rows.append([
+                    InlineKeyboardButton(f"👤 {a}", callback_data=f"acc_info_{a}"),
+                    InlineKeyboardButton("🗑 Удалить", callback_data=f"del_acc_{a}"),
+                ])
+        kb_rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu_back")])
+        await query.edit_message_text(
+            msg + ("\n\n👤 *Аккаунты:*" if accounts else "\n\n📭 Нет аккаунтов."),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+        )
+        return
+
+    # ── Add account ────────────────────────────────────────────────────────
     if data == "menu_add_account":
         set_state(context, S_ADD_ACCOUNT_NAME)
         await query.edit_message_text(
@@ -191,12 +289,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    # ── Upload ─────────────────────────────────────────────────────────────
     if data == "menu_upload":
         await _upload_begin(update, context)
         return
 
-    # ── Account selection ──────────────────────────────────────────────────
-    if data.startswith("acc_"):
+    # ── Bulk import from channel ───────────────────────────────────────────
+    if data == "menu_bulk":
+        await _bulk_begin(update, context)
+        return
+
+    # ── Account selection (for upload) ─────────────────────────────────────
+    if data.startswith("acc_") and not data.startswith("acc_info_"):
         account = data[4:]
         context.user_data["account"] = account
         set_state(context, S_UPLOAD_VIDEO)
@@ -207,12 +311,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # ── Visibility selection ───────────────────────────────────────────────
+    # ── Account selection (for bulk import) ───────────────────────────────
+    if data.startswith("bulk_acc_"):
+        account = data[9:]
+        context.user_data["account"] = account
+        set_state(context, S_BULK_URL)
+        await query.edit_message_text(
+            f"✅ Аккаунт: `{account}`\n\n"
+            "🔗 Отправьте ссылку на YouTube или TikTok канал/профиль:\n\n"
+            "Примеры:\n"
+            "• `https://www.youtube.com/@channel`\n"
+            "• `https://www.tiktok.com/@username`\n\n"
+            "Бот скачает все видео от старых к новым и загрузит их в TikTok.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Visibility selection (upload) ──────────────────────────────────────
     if data in ("vis_0", "vis_1"):
         context.user_data["visibility"] = 0 if data == "vis_0" else 1
-        vis_label = "🌐 Публичное" if data == "vis_0" else "🔒 Приватное"
-        account   = context.user_data.get("account", "?")
-        title     = context.user_data.get("title", "?")
+        vis_label  = "🌐 Публичное" if data == "vis_0" else "🔒 Приватное"
+        account    = context.user_data.get("account", "?")
+        title      = context.user_data.get("title", "?")
         video_path = context.user_data.get("video_path")
         yt_url     = context.user_data.get("youtube_url")
         source     = f"`{Path(video_path).name}`" if video_path else f"`{yt_url}`"
@@ -233,6 +353,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    # ── Visibility selection (bulk import) ────────────────────────────────
+    if data in ("bulk_vis_0", "bulk_vis_1"):
+        visibility = 0 if data == "bulk_vis_0" else 1
+        context.user_data["bulk_visibility"] = visibility
+        account = context.user_data.get("account", "?")
+        url     = context.user_data.get("bulk_url", "?")
+        vis_label = "🌐 Публичное" if visibility == 0 else "🔒 Приватное"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Начать импорт", callback_data="bulk_confirm"),
+            InlineKeyboardButton("❌ Отмена",         callback_data="cancel"),
+        ]])
+        await query.edit_message_text(
+            f"📋 *Импорт из аккаунта*\n\n"
+            f"👤 TikTok аккаунт: `{account}`\n"
+            f"🔗 Источник: `{url}`\n"
+            f"👁 Видимость: {vis_label}\n\n"
+            "Начать? Бот будет загружать видео в фоне.",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
     # ── Confirm / cancel upload ────────────────────────────────────────────
     if data == "cancel_upload":
         _cleanup(context)
@@ -241,6 +383,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if data == "confirm_upload":
         await _do_upload(update, context)
+        return
+
+    # ── Confirm bulk import ───────────────────────────────────────────────
+    if data == "bulk_confirm":
+        await _start_bulk_import(update, context)
+        return
+
+    # ── Cancel bulk import ────────────────────────────────────────────────
+    if data == "bulk_cancel":
+        with _bulk_lock:
+            job = _bulk_jobs.get(chat_id)
+        if job:
+            job.cancel_flag.set()
+            job.status = "cancelled"
+        await query.edit_message_text("🛑 Импорт остановлен. /start — главное меню")
         return
 
     # ── General cancel ─────────────────────────────────────────────────────
@@ -256,7 +413,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _upload_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     accounts = get_saved_accounts()
-    query = update.callback_query
+    query    = update.callback_query
 
     if not accounts:
         await query.edit_message_text(
@@ -282,11 +439,252 @@ async def _upload_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-# ── Do the actual upload ───────────────────────────────────────────────────
+# ── Start bulk import flow ─────────────────────────────────────────────────
+
+async def _bulk_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    accounts = get_saved_accounts()
+    query    = update.callback_query
+    chat_id  = update.effective_chat.id
+
+    # Check if there's already a running job
+    with _bulk_lock:
+        job = _bulk_jobs.get(chat_id)
+    if job and job.status == "running":
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Остановить", callback_data="bulk_cancel"),
+            InlineKeyboardButton("◀️ Назад",      callback_data="menu_back"),
+        ]])
+        await query.edit_message_text(
+            f"🔄 *Импорт уже идёт*\n\n"
+            f"👤 {job.account}\n"
+            f"🔗 {job.url}\n"
+            f"📊 Загружено: {job.current}/{job.total or '?'}",
+            parse_mode="Markdown", reply_markup=kb,
+        )
+        return
+
+    if not accounts:
+        await query.edit_message_text(
+            "❌ Нет сохранённых аккаунтов.\n\nСначала добавьте аккаунт через /addaccount"
+        )
+        return
+
+    if len(accounts) == 1:
+        context.user_data["account"] = accounts[0]
+        set_state(context, S_BULK_URL)
+        await query.edit_message_text(
+            f"✅ Аккаунт: `{accounts[0]}`\n\n"
+            "🔗 Отправьте ссылку на YouTube или TikTok канал/профиль:\n\n"
+            "Примеры:\n"
+            "• `https://www.youtube.com/@channel`\n"
+            "• `https://www.tiktok.com/@username`\n\n"
+            "Бот скачает все видео от старых к новым и загрузит их в TikTok.",
+            parse_mode="Markdown",
+        )
+        return
+
+    keyboard = [[InlineKeyboardButton(a, callback_data=f"bulk_acc_{a}")] for a in accounts]
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    await query.edit_message_text(
+        "👤 В какой TikTok аккаунт загружать?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ── Start the actual bulk import background task ───────────────────────────
+
+async def _start_bulk_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query      = update.callback_query
+    chat_id    = update.effective_chat.id
+    account    = context.user_data.get("account")
+    url        = context.user_data.get("bulk_url")
+    visibility = context.user_data.get("bulk_visibility", 0)
+
+    job = BulkJob(chat_id=chat_id, account=account, url=url, visibility=visibility)
+    with _bulk_lock:
+        _bulk_jobs[chat_id] = job
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛑 Остановить", callback_data="bulk_cancel"),
+    ]])
+    await query.edit_message_text(
+        "🔄 *Импорт запущен в фоне!*\n\n"
+        f"👤 Аккаунт: `{account}`\n"
+        f"🔗 Источник: `{url}`\n\n"
+        "Бот будет отправлять обновления по ходу загрузки.\n"
+        "Вы можете продолжать пользоваться ботом.",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+    # Launch background thread — bot stays responsive
+    app = context.application
+    loop = asyncio.get_event_loop()
+    threading.Thread(
+        target=_bulk_worker,
+        args=(job, app, loop),
+        daemon=True,
+    ).start()
+
+    set_state(context, S_IDLE)
+    for key in ("account", "bulk_url", "bulk_visibility"):
+        context.user_data.pop(key, None)
+
+
+def _bulk_worker(job: BulkJob, app: Application, loop: asyncio.AbstractEventLoop) -> None:
+    """
+    Runs in a background thread.
+    1. Uses yt-dlp to get the full video list (oldest first).
+    2. Downloads each video one at a time.
+    3. Uploads it to TikTok via cli.py.
+    4. Deletes the local file immediately to free disk space.
+    """
+    def send(text: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=job.chat_id, text=text, parse_mode="Markdown"),
+            loop,
+        ).result(timeout=30)
+
+    try:
+        job.status = "running"
+
+        # ── Step 1: Get video list with yt-dlp (no download, oldest first) ──
+        send(f"📋 Получаю список видео из `{job.url}`…")
+
+        ydl_flat_cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--flat-playlist",
+            "--print", "%(id)s\t%(title)s\t%(url)s",
+            "--playlist-reverse",   # oldest first
+            "--no-warnings",
+            "--quiet",
+            job.url,
+        ]
+        proc = subprocess.run(
+            ydl_flat_cmd,
+            capture_output=True, text=True, timeout=120,
+            cwd=str(UPLOADER_DIR),
+        )
+        if proc.returncode != 0 and not proc.stdout.strip():
+            send(f"❌ Не удалось получить список видео:\n```\n{proc.stderr[-500:]}\n```")
+            job.status = "error"
+            return
+
+        lines = [l for l in proc.stdout.strip().splitlines() if l.strip()]
+        if not lines:
+            send("❌ Плейлист пуст или ссылка не поддерживается.")
+            job.status = "error"
+            return
+
+        job.total = len(lines)
+        send(f"✅ Найдено видео: *{job.total}*\nНачинаю загрузку от самых старых…")
+
+        # ── Step 2: Process each video ────────────────────────────────────
+        for idx, line in enumerate(lines, 1):
+            if job.cancel_flag.is_set():
+                send(f"🛑 Импорт остановлен на видео {idx}/{job.total}.")
+                job.status = "cancelled"
+                return
+
+            parts = line.split("\t", 2)
+            vid_id    = parts[0].strip() if len(parts) > 0 else ""
+            vid_title = parts[1].strip() if len(parts) > 1 else f"video_{idx}"
+            vid_url   = parts[2].strip() if len(parts) > 2 else job.url
+
+            # Sanitize title for TikTok (max 150 chars)
+            safe_title = re.sub(r'[^\w\s\-.,!?()а-яёА-ЯЁ]', '', vid_title)[:150].strip() or f"video_{idx}"
+
+            send(f"📥 *{idx}/{job.total}* Скачиваю:\n_{safe_title}_")
+
+            out_file = VIDEOS_DIR / f"bulk_{job.chat_id}_{idx}.mp4"
+
+            # Download video to disk
+            ydl_dl_cmd = [
+                sys.executable, "-m", "yt_dlp",
+                "--no-playlist",
+                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+                "-o", str(out_file),
+                "--no-warnings",
+                "--quiet",
+                vid_url,
+            ]
+            dl_proc = subprocess.run(
+                ydl_dl_cmd,
+                capture_output=True, text=True, timeout=300,
+                cwd=str(UPLOADER_DIR),
+            )
+            if dl_proc.returncode != 0 or not out_file.exists():
+                send(f"⚠️ *{idx}/{job.total}* Не удалось скачать, пропускаю.\n```\n{dl_proc.stderr[-300:]}\n```")
+                job.current = idx
+                continue
+
+            if job.cancel_flag.is_set():
+                out_file.unlink(missing_ok=True)
+                send(f"🛑 Импорт остановлен после скачивания {idx}/{job.total}.")
+                job.status = "cancelled"
+                return
+
+            send(f"📤 *{idx}/{job.total}* Публикую в TikTok…")
+
+            # Upload via cli.py
+            try:
+                rc, stdout, stderr = _run_upload_with_file(
+                    account=job.account,
+                    video_path=str(out_file),
+                    title=safe_title,
+                    visibility=job.visibility,
+                )
+            except subprocess.TimeoutExpired:
+                send(f"⚠️ *{idx}/{job.total}* Таймаут загрузки, пропускаю.")
+                out_file.unlink(missing_ok=True)
+                job.current = idx
+                continue
+            finally:
+                # Always delete the local file to free disk
+                out_file.unlink(missing_ok=True)
+
+            if rc == 0:
+                send(f"✅ *{idx}/{job.total}* Опубликовано: _{safe_title}_")
+            else:
+                output = (stdout + "\n" + stderr).strip()
+                send(f"⚠️ *{idx}/{job.total}* Ошибка публикации:\n```\n{output[-300:]}\n```")
+
+            job.current = idx
+
+        send(f"🎉 *Импорт завершён!*\nВсего загружено: {job.total} видео из `{job.url}`.")
+        job.status = "done"
+
+    except Exception as e:
+        logger.exception("Bulk worker error: %s", e)
+        try:
+            send(f"❌ Критическая ошибка импорта: {e}")
+        except Exception:
+            pass
+        job.status = "error"
+
+
+def _run_upload_with_file(account: str, video_path: str, title: str,
+                           visibility: int, timeout: int = 600) -> tuple[int, str, str]:
+    """Upload a local file to TikTok using cli.py with an absolute path."""
+    cmd = [
+        sys.executable, "cli.py", "upload",
+        "-u", account,
+        "-v", video_path,
+        "-t", title,
+        "-vi", str(visibility),
+    ]
+    result = subprocess.run(
+        cmd, cwd=str(UPLOADER_DIR), capture_output=True, text=True, timeout=timeout,
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+# ── Do the actual single-video upload ─────────────────────────────────────
 
 async def _do_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.edit_message_text("⏳ Загружаю видео в TikTok, подождите...")
+    await query.edit_message_text("⏳ Загружаю видео в TikTok (в фоне)…\nБот не заморозится.")
 
     account    = context.user_data.get("account")
     title      = context.user_data.get("title")
@@ -298,15 +696,16 @@ async def _do_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if yt_url:
         args += ["-yt", yt_url]
     else:
-        args += ["-v", Path(video_path).name]
+        args += ["-v", video_path]
 
+    # Run in executor so the event loop (and bot) stay responsive
+    loop = asyncio.get_event_loop()
     try:
-        loop = asyncio.get_event_loop()
         returncode, stdout, stderr = await loop.run_in_executor(
-            None, lambda: run_uploader(args, timeout=180)
+            None, lambda: run_uploader(args, timeout=600)
         )
     except subprocess.TimeoutExpired:
-        await query.message.reply_text("❌ Таймаут (>3 мин). Попробуйте позже.")
+        await query.message.reply_text("❌ Таймаут (>10 мин). Попробуйте позже.")
         _cleanup(context)
         return
     except Exception as e:
@@ -314,7 +713,7 @@ async def _do_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         _cleanup(context)
         return
 
-    output = (stdout + "\n" + stderr).strip()
+    output  = (stdout + "\n" + stderr).strip()
     preview = output[-1000:] if len(output) > 1000 else output
 
     if returncode == 0 and any(w in output.lower() for w in ("success", "uploaded", "video_id")):
@@ -339,14 +738,14 @@ def _cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
     set_state(context, S_IDLE)
 
 
-# ── Text message handler (state machine) ───────────────────────────────────
+# ── Text message handler (state machine) ─────────────────────────────────
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(context)
     text  = update.message.text.strip()
     logger.info("on_text user=%s state=%s", update.effective_user.id, state)
 
-    # ── ADD ACCOUNT: waiting for name ──────────────────────────────────────
+    # ── ADD ACCOUNT: waiting for name ─────────────────────────────────────
     if state == S_ADD_ACCOUNT_NAME:
         if not text.replace("_", "").replace("-", "").isalnum():
             await update.message.reply_text(
@@ -369,7 +768,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # ── ADD ACCOUNT: waiting for cookie ───────────────────────────────────
+    # ── ADD ACCOUNT: waiting for cookie ──────────────────────────────────
     if state == S_ADD_ACCOUNT_COOKIE:
         if len(text) < 20:
             await update.message.reply_text("❌ Значение слишком короткое. Попробуйте ещё раз:")
@@ -390,7 +789,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # ── UPLOAD: waiting for video / link ───────────────────────────────────
+    # ── UPLOAD: waiting for video / link ──────────────────────────────────
     if state == S_UPLOAD_VIDEO:
         if "youtube.com" in text or "youtu.be" in text:
             context.user_data["youtube_url"] = text
@@ -404,7 +803,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("❌ Отправьте видео-файл или YouTube-ссылку.")
         return
 
-    # ── UPLOAD: waiting for title ──────────────────────────────────────────
+    # ── UPLOAD: waiting for title ─────────────────────────────────────────
     if state == S_UPLOAD_TITLE:
         if len(text) > 2200:
             await update.message.reply_text(
@@ -419,18 +818,39 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("👁 Видимость видео:", reply_markup=keyboard)
         return
 
+    # ── BULK: waiting for channel URL ─────────────────────────────────────
+    if state == S_BULK_URL:
+        if not (text.startswith("http://") or text.startswith("https://")):
+            await update.message.reply_text(
+                "❌ Введите полную ссылку (начиная с https://).\n\n"
+                "Например: `https://www.youtube.com/@channel`",
+                parse_mode="Markdown",
+            )
+            return
+        context.user_data["bulk_url"] = text
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌐 Публичное", callback_data="bulk_vis_0"),
+            InlineKeyboardButton("🔒 Приватное", callback_data="bulk_vis_1"),
+        ]])
+        await update.message.reply_text(
+            f"✅ Ссылка: `{text}`\n\n👁 Видимость для всех загружаемых видео:",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
     # ── Not in any flow ────────────────────────────────────────────────────
     await update.message.reply_text("Нажмите /start для главного меню.")
 
 
-# ── Video file handler ─────────────────────────────────────────────────────
+# ── Video file handler ────────────────────────────────────────────────────
 
 async def on_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if get_state(context) != S_UPLOAD_VIDEO:
         await update.message.reply_text("Нажмите /start и выберите «Загрузить видео».")
         return
 
-    msg = await update.message.reply_text("⏳ Скачиваю видео...")
+    msg   = await update.message.reply_text("⏳ Скачиваю видео...")
     video = update.message.video or update.message.document
     if not video:
         await msg.edit_text("❌ Файл не найден. Отправьте видео ещё раз.")
@@ -453,7 +873,7 @@ async def on_video_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-# ── /addaccount command ────────────────────────────────────────────────────
+# ── /addaccount command ───────────────────────────────────────────────────
 
 async def cmd_add_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     set_state(context, S_ADD_ACCOUNT_NAME)
@@ -466,7 +886,7 @@ async def cmd_add_account(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-# ── /upload command ────────────────────────────────────────────────────────
+# ── /upload command ───────────────────────────────────────────────────────
 
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     accounts = get_saved_accounts()
@@ -494,13 +914,13 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ── Error handler ──────────────────────────────────────────────────────────
+# ── Error handler ─────────────────────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception:", exc_info=context.error)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")

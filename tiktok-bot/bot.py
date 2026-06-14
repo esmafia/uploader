@@ -524,7 +524,10 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query", "inline_query"],
+    )
 
 
 if __name__ == "__main__":

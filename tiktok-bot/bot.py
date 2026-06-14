@@ -181,6 +181,7 @@ async def cmd_add_account(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def add_account_start_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
     await update.callback_query.edit_message_text(
         "👤 *Добавление аккаунта TikTok*\n\n"
         "Введите имя для аккаунта (латинские буквы, без пробелов):\n"
@@ -268,6 +269,7 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def upload_start_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
     accounts = get_saved_accounts()
     if not accounts:
         await update.callback_query.edit_message_text(

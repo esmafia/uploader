@@ -1,0 +1,71 @@
+name: TikTok Bulk Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: 'TikTok account name'
+        required: true
+        type: string
+      source_url:
+        description: 'Source URL (YouTube/TikTok channel)'
+        required: true
+        type: string
+      visibility:
+        description: 'Visibility (0=public, 1=private)'
+        required: true
+        default: '0'
+        type: string
+      cookie_b64:
+        description: 'TikTok session cookie (base64 encoded)'
+        required: true
+        type: string
+      chat_id:
+        description: 'Telegram chat ID for progress updates'
+        required: true
+        type: string
+
+jobs:
+  bulk-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            chromium-browser chromium-chromedriver \
+            ffmpeg xvfb
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yt-dlp
+          cd tiktok-bot/uploader
+          pip install -r requirements.txt
+
+      - name: Run bulk upload
+        env:
+          ACCOUNT: ${{ inputs.account }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          VISIBILITY: ${{ inputs.visibility }}
+          COOKIE_B64: ${{ inputs.cookie_b64 }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DISPLAY: ':99'
+          CHROME_BIN: /usr/bin/chromium-browser
+          CHROMEDRIVER_PATH: /usr/bin/chromedriver
+        run: |
+          Xvfb :99 -screen 0 1280x720x24 &
+          sleep 2
+          python tiktok-bot/bulk_upload_runner.py

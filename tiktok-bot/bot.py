@@ -12,12 +12,16 @@ Improvements:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import re
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -493,6 +497,60 @@ async def _bulk_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ── Start the actual bulk import background task ───────────────────────────
 
+def _try_dispatch_github(account: str, url: str, visibility: int, chat_id: int) -> bool:
+    """
+    Dispatch a GitHub Actions workflow_dispatch event.
+    Returns True if the request was accepted (HTTP 204), False otherwise.
+    Requires env vars GITHUB_TOKEN and GITHUB_REPO.
+    """
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    github_repo  = os.environ.get("GITHUB_REPO", "").strip()
+    if not github_token or not github_repo:
+        return False
+
+    cookie_file = COOKIES_DIR / f"tiktok_session-{account}"
+    if not cookie_file.exists():
+        logger.error("Cookie file not found for account %s", account)
+        return False
+
+    cookie_b64 = base64.b64encode(cookie_file.read_bytes()).decode()
+
+    payload = json.dumps({
+        "ref": os.environ.get("GITHUB_BRANCH", "main"),
+        "inputs": {
+            "account":    account,
+            "source_url": url,
+            "visibility": str(visibility),
+            "cookie_b64": cookie_b64,
+            "chat_id":    str(chat_id),
+        },
+    }).encode()
+
+    api_url = (
+        f"https://api.github.com/repos/{github_repo}"
+        f"/actions/workflows/tiktok_bulk_upload.yml/dispatches"
+    )
+    req = urllib.request.Request(
+        api_url, data=payload,
+        headers={
+            "Authorization": f"Bearer {github_token}",
+            "Accept":        "application/vnd.github+json",
+            "Content-Type":  "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 204
+    except urllib.error.HTTPError as e:
+        logger.error("GitHub dispatch HTTP error: %s %s", e.code, e.read()[:300])
+        return False
+    except Exception as e:
+        logger.error("GitHub dispatch error: %s", e)
+        return False
+
+
 async def _start_bulk_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query      = update.callback_query
     chat_id    = update.effective_chat.id
@@ -500,6 +558,26 @@ async def _start_bulk_import(update: Update, context: ContextTypes.DEFAULT_TYPE)
     url        = context.user_data.get("bulk_url")
     visibility = context.user_data.get("bulk_visibility", 0)
 
+    # ── Try GitHub Actions first (avoids Replit dying under heavy load) ──────
+    dispatched = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: _try_dispatch_github(account, url, visibility, chat_id)
+    )
+
+    if dispatched:
+        await query.edit_message_text(
+            "☁️ *Импорт отправлен на GitHub Actions!*\n\n"
+            f"👤 Аккаунт: `{account}`\n"
+            f"🔗 Источник: `{url}`\n\n"
+            "Бот будет присылать обновления по ходу загрузки.\n"
+            "Replit при этом не нагружается.",
+            parse_mode="Markdown",
+        )
+        set_state(context, S_IDLE)
+        for key in ("account", "bulk_url", "bulk_visibility"):
+            context.user_data.pop(key, None)
+        return
+
+    # ── Fallback: run locally in a background thread ─────────────────────────
     job = BulkJob(chat_id=chat_id, account=account, url=url, visibility=visibility)
     with _bulk_lock:
         _bulk_jobs[chat_id] = job
@@ -548,21 +626,21 @@ def _bulk_worker(job: BulkJob, app: Application, loop: asyncio.AbstractEventLoop
     try:
         job.status = "running"
 
-        # ── Step 1: Get video list with yt-dlp (no download, oldest first) ──
+        # ── Step 1: Get video list with descriptions (oldest first) ──────────
         send(f"📋 Получаю список видео из `{job.url}`…")
 
-        ydl_flat_cmd = [
+        ydl_list_cmd = [
             sys.executable, "-m", "yt_dlp",
-            "--flat-playlist",
-            "--print", "%(id)s\t%(title)s\t%(url)s",
+            "--skip-download",
+            "--print", "%(id)s\t%(title)s\t%(description)s\t%(url)s",
             "--playlist-reverse",   # oldest first
             "--no-warnings",
             "--quiet",
             job.url,
         ]
         proc = subprocess.run(
-            ydl_flat_cmd,
-            capture_output=True, text=True, timeout=120,
+            ydl_list_cmd,
+            capture_output=True, text=True, timeout=180,
             cwd=str(UPLOADER_DIR),
         )
         if proc.returncode != 0 and not proc.stdout.strip():
@@ -586,15 +664,16 @@ def _bulk_worker(job: BulkJob, app: Application, loop: asyncio.AbstractEventLoop
                 job.status = "cancelled"
                 return
 
-            parts = line.split("\t", 2)
-            vid_id    = parts[0].strip() if len(parts) > 0 else ""
+            parts = line.split("\t", 3)
             vid_title = parts[1].strip() if len(parts) > 1 else f"video_{idx}"
-            vid_url   = parts[2].strip() if len(parts) > 2 else job.url
+            vid_desc  = parts[2].strip() if len(parts) > 2 else ""
+            vid_url   = parts[3].strip() if len(parts) > 3 else job.url
 
-            # Sanitize title for TikTok (max 150 chars)
-            safe_title = re.sub(r'[^\w\s\-.,!?()а-яёА-ЯЁ]', '', vid_title)[:150].strip() or f"video_{idx}"
+            # Use original description as caption; fall back to title.
+            # TikTok caption limit: 2200 chars.
+            caption = (vid_desc if vid_desc else vid_title)[:2200].strip() or f"video_{idx}"
 
-            send(f"📥 *{idx}/{job.total}* Скачиваю:\n_{safe_title}_")
+            send(f"📥 *{idx}/{job.total}* Скачиваю:\n_{vid_title[:120]}_")
 
             out_file = VIDEOS_DIR / f"bulk_{job.chat_id}_{idx}.mp4"
 
@@ -632,7 +711,7 @@ def _bulk_worker(job: BulkJob, app: Application, loop: asyncio.AbstractEventLoop
                 rc, stdout, stderr = _run_upload_with_file(
                     account=job.account,
                     video_path=str(out_file),
-                    title=safe_title,
+                    title=caption,
                     visibility=job.visibility,
                 )
             except subprocess.TimeoutExpired:
@@ -645,7 +724,7 @@ def _bulk_worker(job: BulkJob, app: Application, loop: asyncio.AbstractEventLoop
                 out_file.unlink(missing_ok=True)
 
             if rc == 0:
-                send(f"✅ *{idx}/{job.total}* Опубликовано: _{safe_title}_")
+                send(f"✅ *{idx}/{job.total}* Опубликовано: _{vid_title[:100]}_")
             else:
                 output = (stdout + "\n" + stderr).strip()
                 send(f"⚠️ *{idx}/{job.total}* Ошибка публикации:\n```\n{output[-300:]}\n```")

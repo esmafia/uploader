@@ -293,10 +293,10 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
                                         "video_id": video_id
                                 },
                                 "privacy_setting_info": {
-                                        "visibility_type": 0,
-                                        "allow_duet": 1,
-                                        "allow_stitch": 1,
-                                        "allow_comment": 1
+                                        "visibility_type": visibility_type,
+                                        "allow_duet": allow_comment,
+                                        "allow_stitch": allow_stitch,
+                                        "allow_comment": allow_duet
                                 }
                         }
                 ],

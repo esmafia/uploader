@@ -460,7 +460,7 @@ def upload_to_tiktok(video_file, session):
                         headers = {
                                 "Authorization": video_auth,
                                 "Content-Type": "application/octet-stream",
-                                "Content-Disposition": 'attachment; filename="undefined"',
+                                "Content-Disposition": 'attachment; filename="video.mp4"',
                                 "Content-Crc32": crc,
                         }
                         r = session.post(url, headers=headers, data=chunk)

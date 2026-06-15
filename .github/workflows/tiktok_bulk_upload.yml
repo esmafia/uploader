@@ -67,6 +67,12 @@ jobs:
           echo "Chrome binary : $CHROME"
           echo "ChromeDriver  : $CHROMEDRV"
 
+      - name: Notify Telegram start
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ inputs.chat_id }}" \
+            -d text="🚀 Начинаю массовую загрузку!%0AАккаунт: ${{ inputs.account }}%0AИсточник: ${{ inputs.source_url }}"
+
       - name: Run bulk upload
         env:
           ACCOUNT:           ${{ inputs.account }}
@@ -82,3 +88,17 @@ jobs:
           Xvfb :99 -screen 0 1280x720x24 &
           sleep 2
           python tiktok-bot/bulk_upload_runner.py
+
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ inputs.chat_id }}" \
+            -d text="✅ Массовая загрузка завершена!%0AАккаунт: ${{ inputs.account }}%0AИсточник: ${{ inputs.source_url }}"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ inputs.chat_id }}" \
+            -d text="❌ Ошибка при массовой загрузке!%0AАккаунт: ${{ inputs.account }}%0AПроверь логи: https://github.com/esmafia/uploader/actions"

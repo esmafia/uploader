@@ -8,6 +8,8 @@ Improvements:
 - Delete account support
 - Bulk import: give a TikTok/YouTube channel URL, bot downloads oldest→newest
   and publishes each video without stopping
+- GitHub Actions offload: heavy work (bulk + single uploads) dispatched to
+  GitHub Actions so Replit never crashes. Set GITHUB_TOKEN + GITHUB_REPO env vars.
 """
 from __future__ import annotations
 
@@ -497,45 +499,31 @@ async def _bulk_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ── Start the actual bulk import background task ───────────────────────────
 
-def _try_dispatch_github(account: str, url: str, visibility: int, chat_id: int) -> bool:
+def _github_dispatch(workflow_file: str, inputs: dict) -> bool:
     """
-    Dispatch a GitHub Actions workflow_dispatch event.
-    Returns True if the request was accepted (HTTP 204), False otherwise.
-    Requires env vars GITHUB_TOKEN and GITHUB_REPO.
+    Generic GitHub Actions workflow_dispatch helper.
+    Returns True if accepted (HTTP 204). Requires GITHUB_TOKEN + GITHUB_REPO env vars.
     """
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     github_repo  = os.environ.get("GITHUB_REPO", "").strip()
     if not github_token or not github_repo:
         return False
 
-    cookie_file = COOKIES_DIR / f"tiktok_session-{account}"
-    if not cookie_file.exists():
-        logger.error("Cookie file not found for account %s", account)
-        return False
-
-    cookie_b64 = base64.b64encode(cookie_file.read_bytes()).decode()
-
     payload = json.dumps({
-        "ref": os.environ.get("GITHUB_BRANCH", "main"),
-        "inputs": {
-            "account":    account,
-            "source_url": url,
-            "visibility": str(visibility),
-            "cookie_b64": cookie_b64,
-            "chat_id":    str(chat_id),
-        },
+        "ref":    os.environ.get("GITHUB_BRANCH", "main"),
+        "inputs": inputs,
     }).encode()
 
     api_url = (
         f"https://api.github.com/repos/{github_repo}"
-        f"/actions/workflows/tiktok_bulk_upload.yml/dispatches"
+        f"/actions/workflows/{workflow_file}/dispatches"
     )
     req = urllib.request.Request(
         api_url, data=payload,
         headers={
-            "Authorization": f"Bearer {github_token}",
-            "Accept":        "application/vnd.github+json",
-            "Content-Type":  "application/json",
+            "Authorization":        f"Bearer {github_token}",
+            "Accept":               "application/vnd.github+json",
+            "Content-Type":         "application/json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
         method="POST",
@@ -544,11 +532,88 @@ def _try_dispatch_github(account: str, url: str, visibility: int, chat_id: int) 
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 204
     except urllib.error.HTTPError as e:
-        logger.error("GitHub dispatch HTTP error: %s %s", e.code, e.read()[:300])
+        logger.error("GitHub dispatch HTTP %s %s: %s", workflow_file, e.code, e.read()[:300])
         return False
     except Exception as e:
-        logger.error("GitHub dispatch error: %s", e)
+        logger.error("GitHub dispatch error %s: %s", workflow_file, e)
         return False
+
+
+def _try_dispatch_github(account: str, url: str, visibility: int, chat_id: int) -> bool:
+    """Dispatch bulk import to GitHub Actions (avoids Replit dying under heavy load)."""
+    cookie_file = COOKIES_DIR / f"tiktok_session-{account}"
+    if not cookie_file.exists():
+        logger.error("Cookie file not found for account %s", account)
+        return False
+    cookie_b64 = base64.b64encode(cookie_file.read_bytes()).decode()
+    return _github_dispatch("tiktok_bulk_upload.yml", {
+        "account":    account,
+        "source_url": url,
+        "visibility": str(visibility),
+        "cookie_b64": cookie_b64,
+        "chat_id":    str(chat_id),
+    })
+
+
+def _upload_file_to_temphost(file_path: str) -> Optional[str]:
+    """
+    Upload a local video file to 0x0.st (free temp host, files expire in 24h–1 year).
+    Returns the public download URL or None on failure.
+    """
+    try:
+        boundary = "----TGBotBoundary"
+        filename = Path(file_path).name
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: video/mp4\r\n\r\n"
+        ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+
+        req = urllib.request.Request(
+            "https://0x0.st",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            url = resp.read().decode().strip()
+            if url.startswith("https://0x0.st/"):
+                return url
+    except Exception as e:
+        logger.error("Temp host upload error: %s", e)
+    return None
+
+
+def _try_dispatch_github_single(
+    account: str, video_path: str, title: str, visibility: int, chat_id: int
+) -> bool:
+    """
+    Upload video to temp host, then dispatch single upload to GitHub Actions.
+    Returns True if dispatched successfully.
+    """
+    cookie_file = COOKIES_DIR / f"tiktok_session-{account}"
+    if not cookie_file.exists():
+        return False
+    if not os.environ.get("GITHUB_TOKEN") or not os.environ.get("GITHUB_REPO"):
+        return False
+
+    video_url = _upload_file_to_temphost(video_path)
+    if not video_url:
+        logger.warning("Could not upload video to temp host, falling back to local upload")
+        return False
+
+    cookie_b64 = base64.b64encode(cookie_file.read_bytes()).decode()
+    return _github_dispatch("tiktok_single_upload.yml", {
+        "account":    account,
+        "video_url":  video_url,
+        "title":      title,
+        "visibility": str(visibility),
+        "cookie_b64": cookie_b64,
+        "chat_id":    str(chat_id),
+    })
 
 
 async def _start_bulk_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -762,14 +827,36 @@ def _run_upload_with_file(account: str, video_path: str, title: str,
 # ── Do the actual single-video upload ─────────────────────────────────────
 
 async def _do_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.edit_message_text("⏳ Загружаю видео в TikTok (в фоне)…\nБот не заморозится.")
-
+    query      = update.callback_query
     account    = context.user_data.get("account")
     title      = context.user_data.get("title")
     video_path = context.user_data.get("video_path")
     yt_url     = context.user_data.get("youtube_url")
     visibility = context.user_data.get("visibility", 0)
+    chat_id    = update.effective_chat.id
+    loop       = asyncio.get_event_loop()
+
+    # ── Try GitHub Actions for file uploads (avoids Replit crash) ───────────
+    if video_path and not yt_url:
+        await query.edit_message_text(
+            "☁️ Отправляю видео на GitHub Actions…\n"
+            "Replit не будет нагружаться. Результат придёт сообщением."
+        )
+        dispatched = await loop.run_in_executor(
+            None,
+            lambda: _try_dispatch_github_single(account, video_path, title, visibility, chat_id),
+        )
+        if dispatched:
+            _cleanup(context)
+            return
+        # GitHub dispatch failed — inform user and fall back to local
+        await query.message.reply_text(
+            "⚠️ GitHub Actions недоступен — запускаю локально.\n"
+            "Установите `GITHUB_TOKEN` и `GITHUB_REPO` чтобы избежать перегрузки Replit."
+        )
+
+    # ── YouTube URL or fallback local upload ────────────────────────────────
+    await query.edit_message_text("⏳ Загружаю видео в TikTok (в фоне)…\nБот не заморозится.")
 
     args = ["upload", "-u", account, "-t", title, "-vi", str(visibility)]
     if yt_url:
@@ -777,8 +864,6 @@ async def _do_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     else:
         args += ["-v", video_path]
 
-    # Run in executor so the event loop (and bot) stay responsive
-    loop = asyncio.get_event_loop()
     try:
         returncode, stdout, stderr = await loop.run_in_executor(
             None, lambda: run_uploader(args, timeout=600)

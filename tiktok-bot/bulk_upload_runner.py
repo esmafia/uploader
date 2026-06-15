@@ -6,7 +6,7 @@ Required env vars:
   ACCOUNT        — TikTok account name (matches cookie filename)
   SOURCE_URL     — YouTube or TikTok channel/profile URL
   VISIBILITY     — 0 = public, 1 = private (default 0)
-  COOKIE_B64     — base64-encoded contents of the tiktok_session-<name> cookie file
+  COOKIE_B64     — base64-encoded JSON array of cookie objects [{name,value,...}]
   CHAT_ID        — Telegram chat ID to send progress updates to
   TELEGRAM_TOKEN — Telegram bot token
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import pickle
 import subprocess
 import sys
 import urllib.request
@@ -86,11 +87,13 @@ def run_upload(video_path: str, title: str) -> tuple[int, str]:
 
 
 def main() -> None:
-    # ── Write cookie file ────────────────────────────────────────────────────
-    cookie_content = base64.b64decode(COOKIE_B64).decode()
-    cookie_file    = COOKIES_DIR / f"tiktok_session-{ACCOUNT}"
-    cookie_file.write_text(cookie_content)
-    print(f"[+] Cookie written: {cookie_file}")
+    # Decode JSON cookie array and write as pickle file with .cookie extension
+    # (required by tiktok_uploader/cookies.py → load_cookies_from_file)
+    cookie_data = json.loads(base64.b64decode(COOKIE_B64).decode())
+    cookie_file = COOKIES_DIR / f"tiktok_session-{ACCOUNT}.cookie"
+    with open(cookie_file, "wb") as f:
+        pickle.dump(cookie_data, f)
+    print(f"[+] Cookie written: {cookie_file} ({len(cookie_data)} entries)")
 
     send_telegram(
         f"🚀 *GitHub Actions*: импорт запущен\n"
@@ -132,8 +135,6 @@ def main() -> None:
         vid_desc  = parts[2].strip() if len(parts) > 2 else ""
         vid_url   = parts[3].strip() if len(parts) > 3 else SOURCE_URL
 
-        # Use original description as caption; fall back to title.
-        # TikTok caption limit: 2200 chars.
         caption = (vid_desc if vid_desc else vid_title)[:2200].strip() or f"video_{idx}"
 
         send_telegram(f"📥 *{idx}/{total}* Скачиваю:\n_{vid_title[:120]}_")

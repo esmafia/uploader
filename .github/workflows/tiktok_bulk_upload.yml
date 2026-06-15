@@ -27,7 +27,7 @@ on:
 
 jobs:
   bulk-upload:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 360
 
     steps:
@@ -46,6 +46,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             chromium-browser chromium-chromedriver \
             ffmpeg xvfb
+          echo "--- Chromium check ---"
+          which chromium-browser || which chromium || echo "WARNING: chromium not found in PATH"
+          which chromedriver || find /usr -name chromedriver 2>/dev/null | head -3 || echo "WARNING: chromedriver not found"
 
       - name: Install Python dependencies
         run: |
@@ -54,17 +57,27 @@ jobs:
           cd tiktok-bot/uploader
           pip install -r requirements.txt
 
+      - name: Detect Chrome paths
+        id: chrome
+        run: |
+          CHROME=$(which chromium-browser 2>/dev/null || which chromium 2>/dev/null || echo "")
+          CHROMEDRV=$(which chromedriver 2>/dev/null || find /usr -name chromedriver 2>/dev/null | head -1 || echo "")
+          echo "bin=$CHROME" >> "$GITHUB_OUTPUT"
+          echo "driver=$CHROMEDRV" >> "$GITHUB_OUTPUT"
+          echo "Chrome binary : $CHROME"
+          echo "ChromeDriver  : $CHROMEDRV"
+
       - name: Run bulk upload
         env:
-          ACCOUNT: ${{ inputs.account }}
-          SOURCE_URL: ${{ inputs.source_url }}
-          VISIBILITY: ${{ inputs.visibility }}
-          COOKIE_B64: ${{ inputs.cookie_b64 }}
-          CHAT_ID: ${{ inputs.chat_id }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          DISPLAY: ':99'
-          CHROME_BIN: /usr/bin/chromium-browser
-          CHROMEDRIVER_PATH: /usr/bin/chromedriver
+          ACCOUNT:           ${{ inputs.account }}
+          SOURCE_URL:        ${{ inputs.source_url }}
+          VISIBILITY:        ${{ inputs.visibility }}
+          COOKIE_B64:        ${{ inputs.cookie_b64 }}
+          CHAT_ID:           ${{ inputs.chat_id }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DISPLAY:           ':99'
+          CHROME_BIN:        ${{ steps.chrome.outputs.bin }}
+          CHROMEDRIVER_PATH: ${{ steps.chrome.outputs.driver }}
         run: |
           Xvfb :99 -screen 0 1280x720x24 &
           sleep 2

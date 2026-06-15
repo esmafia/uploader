@@ -178,11 +178,14 @@ def do_upload(args) -> None:
             sys.exit(1)
 
     # schedule_time=0 — we bypass TikTok's server-side scheduling entirely.
-    tiktok.upload_video(
+    ok = tiktok.upload_video(
         args.users, args.video, args.title, 0,
         args.comment, args.duet, args.stitch, args.visibility,
         args.brandorganic, args.brandcontent, args.ailabel, args.proxy,
     )
+    if ok is False:
+        eprint("[-] Upload failed.")
+        sys.exit(1)
 
 
 def do_show(args) -> None:

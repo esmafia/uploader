@@ -138,8 +138,18 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
         if not assert_success(project_url, r):
                 return False
 
-        # get project_id
+        # get project_id — check TikTok status_code before accessing project key
         _project_resp = r.json()
+        _tiktok_code = _project_resp.get("status_code", 0)
+        if _tiktok_code != 0:
+                _TIKTOK_ERRORS = {
+                        8:  "Session expired or invalid — refresh your sessionid and msToken cookies",
+                        -1: "Unknown TikTok error",
+                }
+                msg = _TIKTOK_ERRORS.get(_tiktok_code, f"TikTok API error (status_code={_tiktok_code})")
+                eprint(f"[-] {msg}")
+                eprint(f"[-] Full response: {_project_resp}")
+                return False
         if "project" not in _project_resp or "project_id" not in _project_resp.get("project", {}):
                 eprint(f"[-] Unexpected response from project/create: {_project_resp}")
                 return False

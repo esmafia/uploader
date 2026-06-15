@@ -139,7 +139,11 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
                 return False
 
         # get project_id
-        project_id = r.json()["project"]["project_id"]
+        _project_resp = r.json()
+        if "project" not in _project_resp or "project_id" not in _project_resp.get("project", {}):
+                eprint(f"[-] Unexpected response from project/create: {_project_resp}")
+                return False
+        project_id = _project_resp["project"]["project_id"]
         video_id, session_key, upload_id, crcs, upload_host, store_uri, video_auth, aws_auth = upload_to_tiktok(video, session)
 
         url = f"https://{upload_host}/{store_uri}?uploadID={upload_id}&phase=finish&uploadmode=part"

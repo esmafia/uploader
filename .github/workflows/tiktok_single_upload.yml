@@ -81,3 +81,17 @@ jobs:
           Xvfb :99 -screen 0 1280x720x24 &
           sleep 2
           python tiktok-bot/single_upload_runner.py
+
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ inputs.chat_id }}" \
+            -d text="✅ Загрузка завершена!%0AАккаунт: ${{ inputs.account }}%0AВидео: ${{ inputs.video_url }}%0AЗаголовок: ${{ inputs.title }}"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ inputs.chat_id }}" \
+            -d text="❌ Ошибка при загрузке!%0AАккаунт: ${{ inputs.account }}%0AВидео: ${{ inputs.video_url }}%0AПроверь логи: https://github.com/esmafia/uploader/actions"

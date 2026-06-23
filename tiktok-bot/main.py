@@ -280,9 +280,9 @@ async def handle_document(message: Message):
 
     msg = await message.answer("⏳ Читаю файл куков...")
     try:
-        file_obj = await doc.get_file()
-        raw = await file_obj.download_as_bytearray()
-        text = raw.decode("utf-8", errors="replace")
+        file_obj = await bot.get_file(doc.file_id)
+        raw = await bot.download_file(file_obj.file_path)
+        text = raw.read().decode("utf-8", errors="replace")
     except Exception as e:
         await msg.edit_text(f"❌ Не удалось прочитать файл: {e}")
         return

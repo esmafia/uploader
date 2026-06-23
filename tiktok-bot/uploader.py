@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 TikTok uploader — запускается в GitHub Actions.
-Читает куки из TIKTOK_COOKIES (JSON-массив объектов куки).
-Скачанное видео должно быть в ./video.mp4 (рабочий каталог GitHub Actions).
+Куки читаются из двух источников (в порядке приоритета):
+  1. tiktok-bot/cookies.json — файл в репозитории (обновляется через бота)
+  2. TIKTOK_COOKIES env var — JSON-строка (запасной вариант)
 """
 import json
 import logging
@@ -19,31 +20,39 @@ logging.basicConfig(
 logger = logging.getLogger("uploader")
 
 VIDEO_PATH = Path("video.mp4")
+COOKIES_FILE = Path("tiktok-bot/cookies.json")
 TIKTOK_UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload"
 
 
 def load_cookies() -> list:
-    """Читает куки из переменной окружения TIKTOK_COOKIES (JSON-массив)."""
+    """Читает куки из файла репозитория или из переменной окружения."""
+    # Приоритет 1: файл cookies.json в репо (обновляется через бота)
+    if COOKIES_FILE.exists():
+        try:
+            cookies = json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
+            if isinstance(cookies, list) and cookies:
+                logger.info(f"✅ Куки из файла репозитория: {len(cookies)} записей")
+                return cookies
+        except Exception as e:
+            logger.warning(f"Не удалось прочитать {COOKIES_FILE}: {e}")
+
+    # Приоритет 2: переменная окружения TIKTOK_COOKIES
     raw = os.environ.get("TIKTOK_COOKIES", "")
-    if not raw:
-        logger.error(
-            "❌ Переменная TIKTOK_COOKIES не задана!\n"
-            "Добавьте её в GitHub → Settings → Secrets and variables → Actions."
-        )
-        sys.exit(1)
+    if raw:
+        try:
+            cookies = json.loads(raw)
+            if isinstance(cookies, list) and cookies:
+                logger.info(f"✅ Куки из TIKTOK_COOKIES: {len(cookies)} записей")
+                return cookies
+        except Exception as e:
+            logger.error(f"❌ TIKTOK_COOKIES содержит невалидный JSON: {e}")
 
-    try:
-        cookies = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.error(f"❌ TIKTOK_COOKIES содержит невалидный JSON: {exc}")
-        sys.exit(1)
-
-    if not isinstance(cookies, list) or len(cookies) == 0:
-        logger.error("❌ TIKTOK_COOKIES должен быть непустым JSON-массивом объектов.")
-        sys.exit(1)
-
-    logger.info(f"✅ Загружено {len(cookies)} куки.")
-    return cookies
+    logger.error(
+        "❌ Куки не найдены!\n"
+        "Отправьте боту .txt файл с куками TikTok (команда /setcookies),\n"
+        "или добавьте TIKTOK_COOKIES в GitHub Secrets."
+    )
+    sys.exit(1)
 
 
 def run_upload():
@@ -51,7 +60,8 @@ def run_upload():
         logger.error(f"❌ Файл видео не найден: {VIDEO_PATH.resolve()}")
         sys.exit(1)
 
-    logger.info(f"📂 Файл видео: {VIDEO_PATH.resolve()} ({VIDEO_PATH.stat().st_size // 1024} KB)")
+    size_kb = VIDEO_PATH.stat().st_size // 1024
+    logger.info(f"📂 Видео: {VIDEO_PATH.resolve()} ({size_kb} KB)")
 
     cookies = load_cookies()
 
@@ -62,7 +72,7 @@ def run_upload():
         HAS_STEALTH = True
     except ImportError:
         HAS_STEALTH = False
-        logger.warning("playwright-stealth не установлен — работаем без него.")
+        logger.warning("playwright-stealth не установлен.")
 
     with sync_playwright() as pw:
         logger.info("🌐 Запуск Chromium (headless)...")
@@ -93,8 +103,8 @@ def run_upload():
         try:
             context.add_cookies(cookies)
             logger.info("🍪 Куки добавлены в контекст браузера.")
-        except Exception as exc:
-            logger.error(f"❌ Ошибка при добавлении куки: {exc}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при добавлении куки: {e}")
             browser.close()
             sys.exit(1)
 
@@ -104,8 +114,8 @@ def run_upload():
             try:
                 stealth_sync(page)
                 logger.info("🛡 Stealth-режим активен.")
-            except Exception as exc:
-                logger.warning(f"Stealth не применился: {exc}")
+            except Exception as e:
+                logger.warning(f"Stealth не применился: {e}")
 
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -124,20 +134,19 @@ def run_upload():
             if any(x in page.url for x in ["login", "passport", "/account/"]):
                 logger.error(
                     "❌ Не авторизован — TikTok перенаправил на страницу входа.\n"
-                    "Обновите TIKTOK_COOKIES в GitHub Secrets."
+                    "Отправьте боту новый .txt файл с куками (/setcookies)."
                 )
                 browser.close()
                 sys.exit(1)
 
-            logger.info(f"📄 Текущий URL: {page.url}")
-
+            logger.info(f"📄 URL: {page.url}")
             logger.info("🔍 Ищу поле загрузки файла...")
-            file_input = None
 
+            file_input = None
             try:
                 page.wait_for_selector('input[type="file"]', timeout=15_000, state="attached")
                 file_input = page.locator('input[type="file"]').first
-                logger.info("✅ Поле загрузки найдено на основной странице.")
+                logger.info("✅ Поле найдено на основной странице.")
             except Exception:
                 pass
 
@@ -148,29 +157,27 @@ def run_upload():
                     try:
                         frame.wait_for_selector('input[type="file"]', timeout=4_000, state="attached")
                         file_input = frame.locator('input[type="file"]').first
-                        logger.info(f"✅ Поле загрузки найдено в iframe: {frame.url}")
+                        logger.info(f"✅ Поле найдено в iframe: {frame.url}")
                         break
                     except Exception:
                         continue
 
             if file_input is None:
+                page.screenshot(path="debug_no_input.png", full_page=True)
                 logger.error(
                     "❌ Поле загрузки файла не найдено.\n"
-                    "Возможные причины:\n"
-                    "  • Куки устарели — обновите TIKTOK_COOKIES\n"
-                    "  • TikTok изменил интерфейс\n"
-                    "  • Бот не прошёл проверку"
+                    "Куки устарели или TikTok изменил интерфейс.\n"
+                    "Отправьте боту новый .txt файл с куками."
                 )
-                page.screenshot(path="debug_no_input.png", full_page=True)
                 browser.close()
                 sys.exit(1)
 
-            logger.info(f"📤 Загружаю файл: {VIDEO_PATH}")
+            logger.info(f"📤 Загружаю файл в браузер...")
             file_input.set_input_files(str(VIDEO_PATH.resolve()))
-            logger.info("✅ Файл передан браузеру. Жду обработки TikTok...")
+            logger.info("✅ Файл передан. Жду обработки TikTok...")
             time.sleep(8)
 
-            logger.info("⏳ Ожидаю появления редактора описания (до 3 мин)...")
+            logger.info("⏳ Жду редактор описания (до 3 мин)...")
             caption_selectors = [
                 '[data-e2e="caption-content"]',
                 'div[class*="caption"] div[contenteditable="true"]',
@@ -187,13 +194,12 @@ def run_upload():
                         el = page.locator(sel).first
                         if el.is_visible(timeout=1_000):
                             caption_el = el
-                            logger.info(f"✅ Редактор описания найден: {sel}")
+                            logger.info(f"✅ Редактор: {sel}")
                             break
                     except Exception:
                         pass
                 if caption_el:
                     break
-
                 for frame in page.frames:
                     if frame == page.main_frame:
                         continue
@@ -202,22 +208,18 @@ def run_upload():
                             el = frame.locator(sel).first
                             if el.is_visible(timeout=800):
                                 caption_el = el
-                                logger.info(f"✅ Редактор описания в iframe: {sel}")
                                 break
                         except Exception:
                             pass
                     if caption_el:
                         break
-
                 if caption_el:
                     break
-                logger.info("  ещё жду...")
+                logger.info("  ожидаю...")
                 time.sleep(5)
 
             if caption_el is None:
-                logger.warning(
-                    "⚠️ Редактор описания не найден за 3 минуты — пропускаю описание."
-                )
+                logger.warning("⚠️ Редактор описания не найден — пропускаю описание.")
                 page.screenshot(path="debug_no_caption.png", full_page=True)
 
             time.sleep(5)
@@ -239,32 +241,29 @@ def run_upload():
                     btn = page.locator(sel).first
                     if btn.is_visible(timeout=3_000):
                         post_btn = btn
-                        logger.info(f"✅ Кнопка публикации найдена: {sel}")
+                        logger.info(f"✅ Кнопка: {sel}")
                         break
                 except Exception:
                     continue
 
             if post_btn is None:
-                logger.error(
-                    "❌ Кнопка «Опубликовать» не найдена.\n"
-                    "Интерфейс TikTok Studio мог измениться."
-                )
                 page.screenshot(path="debug_no_postbtn.png", full_page=True)
+                logger.error("❌ Кнопка «Опубликовать» не найдена. Интерфейс TikTok изменился.")
                 browser.close()
                 sys.exit(1)
 
-            logger.info("🖱 Нажимаю кнопку публикации...")
+            logger.info("🖱 Нажимаю кнопку...")
             post_btn.click()
             time.sleep(3)
 
-            logger.info("⏳ Жду подтверждения публикации (до 60 сек)...")
+            logger.info("⏳ Жду подтверждения (до 60 сек)...")
             success = False
             for attempt in range(20):
                 time.sleep(3)
                 current_url = page.url
                 if any(x in current_url for x in ["content", "creator", "profile", "success"]):
                     success = True
-                    logger.info(f"✅ Перенаправлен на: {current_url}")
+                    logger.info(f"✅ Перенаправлен: {current_url}")
                     break
                 try:
                     toast = page.locator(
@@ -272,14 +271,14 @@ def run_upload():
                     ).first
                     if toast.is_visible(timeout=500):
                         success = True
-                        logger.info("✅ Toast уведомление об успехе обнаружено.")
+                        logger.info("✅ Toast об успехе.")
                         break
                 except Exception:
                     pass
-                logger.info(f"  попытка {attempt + 1}/20, URL: {current_url}")
+                logger.info(f"  попытка {attempt+1}/20")
 
-        except Exception as exc:
-            logger.exception(f"❌ Неожиданная ошибка: {exc}")
+        except Exception as e:
+            logger.exception(f"❌ Ошибка: {e}")
             try:
                 page.screenshot(path="debug_error.png", full_page=True)
             except Exception:
@@ -291,13 +290,11 @@ def run_upload():
 
         if success:
             logger.info("🎉 Видео успешно опубликовано в TikTok!")
-            sys.exit(0)
         else:
             logger.warning(
-                "⚠️ Статус публикации неизвестен.\n"
-                "Проверьте TikTok Studio вручную: https://www.tiktok.com/tiktokstudio"
+                "⚠️ Статус неизвестен. Проверьте TikTok Studio: https://www.tiktok.com/tiktokstudio"
             )
-            sys.exit(0)
+        sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "URL видео для загрузки (YouTube, TikTok, etc.)"
+        description: "URL видео (YouTube, TikTok, etc.)"
         required: true
         type: string
 

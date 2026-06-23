@@ -1,0 +1,48 @@
+name: Upload Video to TikTok
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL видео для загрузки (YouTube, TikTok, etc.)"
+        required: true
+        type: string
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r tiktok-bot/requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Download video with yt-dlp
+        run: |
+          yt-dlp \
+            --format "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+            --merge-output-format mp4 \
+            --output "video.mp4" \
+            --no-playlist \
+            "${{ github.event.inputs.url }}"
+
+      - name: Upload to TikTok
+        env:
+          TIKTOK_COOKIES: ${{ secrets.TIKTOK_COOKIES }}
+        run: |
+          python tiktok-bot/uploader.py

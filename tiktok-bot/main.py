@@ -91,6 +91,21 @@ def _gh_get(path: str, timeout: int = 15) -> tuple[bool, dict]:
         return False, {"message": str(e)}
 
 
+def save_yt_cookies_to_github(netscape_text: str) -> tuple[bool, str]:
+    """Сохраняет куки YouTube в репозиторий в Netscape-формате (для yt-dlp)."""
+    content_b64 = base64.b64encode(netscape_text.encode()).decode()
+    ok, existing = _gh_get(f"contents/tiktok-bot/yt_cookies.txt")
+    sha = existing.get("sha") if ok else None
+    body = {"message": "update: YouTube cookies (yt-dlp)", "content": content_b64}
+    if sha:
+        body["sha"] = sha
+    ok, resp = _gh_put(f"contents/tiktok-bot/yt_cookies.txt", body)
+    if ok:
+        lines = sum(1 for l in netscape_text.splitlines() if l.strip() and not l.startswith("#"))
+        return True, f"сохранены ({lines} записей)"
+    return False, f"ошибка: {resp.get('message', resp)}"
+
+
 def save_cookies_to_github(cookies_json: list) -> tuple[bool, str]:
     """Сохраняет куки в репозиторий как cookies.json (создаёт или обновляет)."""
     content_b64 = base64.b64encode(
@@ -287,24 +302,47 @@ async def handle_document(message: Message):
         await msg.edit_text(f"❌ Не удалось прочитать файл: {e}")
         return
 
-    if "tiktok.com" not in text.lower() and "# Netscape" not in text:
+    if "# Netscape" not in text and "tiktok.com" not in text.lower() and "youtube.com" not in text.lower() and "google.com" not in text.lower():
         await msg.edit_text(
-            "❌ Файл не похож на cookies TikTok.\n"
+            "❌ Файл не похож на cookies.\n"
             "Используйте расширение *Get cookies.txt LOCALLY* и экспортируйте в Netscape-формате.",
             parse_mode="Markdown",
         )
         return
 
-    await msg.edit_text("⏳ Парсю и сохраняю куки в репозиторий...")
+    await msg.edit_text("⏳ Определяю тип куков и сохраняю в репозиторий...")
     cookies = parse_netscape_cookies(text)
     if not cookies:
         await msg.edit_text("❌ Не нашёл куки в файле. Убедитесь что это Netscape-формат.")
         return
 
-    ok, result_msg = await asyncio.to_thread(save_cookies_to_github, cookies)
+    has_tiktok  = any("tiktok" in c.get("domain","").lower() for c in cookies)
+    has_youtube = any(
+        d in c.get("domain","").lower()
+        for c in cookies for d in ("youtube", "google", "ggpht")
+    )
+
+    results = []
+    if has_tiktok:
+        ok, msg_text = await asyncio.to_thread(save_cookies_to_github, cookies)
+        results.append(f"{'✅' if ok else '❌'} TikTok куки: {msg_text}")
+
+    if has_youtube:
+        ok, msg_text = await asyncio.to_thread(save_yt_cookies_to_github, text)
+        results.append(f"{'✅' if ok else '❌'} YouTube куки: {msg_text}")
+
+    if not has_tiktok and not has_youtube:
+        await msg.edit_text(
+            "⚠️ Куки сохранены как универсальные.\n"
+            "Если что-то пойдёт не так — экспортируйте куки с нужного сайта отдельно.",
+            parse_mode="Markdown",
+        )
+        ok, msg_text = await asyncio.to_thread(save_cookies_to_github, cookies)
+        ok2, msg_text2 = await asyncio.to_thread(save_yt_cookies_to_github, text)
+        results = [f"{'✅' if ok else '❌'} {msg_text}", f"{'✅' if ok2 else '❌'} {msg_text2}"]
+
     await msg.edit_text(
-        f"{result_msg}\n\n"
-        "Теперь отправьте ссылку на видео или канал.",
+        "\n".join(results) + "\n\nТеперь отправьте ссылку на видео или канал.",
         parse_mode="Markdown",
     )
 

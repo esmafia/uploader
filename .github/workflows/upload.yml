@@ -34,19 +34,20 @@ jobs:
 
       - name: Download video with yt-dlp
         run: |
-          COOKIES_ARG=""
-          if [ -f "tiktok-bot/yt_cookies.txt" ]; then
-            echo "Using YouTube cookies from repo"
-            COOKIES_ARG="--cookies tiktok-bot/yt_cookies.txt"
-          fi
-
           yt-dlp \
-            $COOKIES_ARG \
-            --format "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+            --extractor-args "youtube:player_client=tv,mweb" \
+            --format "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best[ext=mp4]/best" \
             --merge-output-format mp4 \
             --output "video.mp4" \
             --no-playlist \
+            --retries 5 \
+            --fragment-retries 5 \
             "${{ github.event.inputs.url }}"
+
+      - name: Check video file
+        run: |
+          ls -lh video.mp4
+          echo "Video size: $(du -sh video.mp4 | cut -f1)"
 
       - name: Upload to TikTok
         env:
